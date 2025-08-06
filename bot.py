@@ -6,6 +6,7 @@ from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, OperationFailure
 from bson import ObjectId
 from dotenv import load_dotenv
+import time
 
 # ตั้งค่า Logging
 logging.basicConfig(
@@ -29,35 +30,40 @@ try:
 except Exception as e:
     logger.error(f"Failed to remove webhook: {e}")
 
+# ฟังก์ชันเชื่อมต่อ MongoDB
+def connect_mongodb():
+    for attempt in range(3):  # ลองเชื่อมต่อ 3 ครั้ง
+        try:
+            client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+            client.admin.command('ping')  # ทดสอบการเชื่อมต่อ
+            logger.info("Connected to MongoDB successfully")
+            db = client["stock-management"]
+            collections = db.list_collection_names()
+            logger.info(f"Collections in database: {collections}")
+            return db
+        except ConnectionFailure as e:
+            logger.error(f"MongoDB connection failed (attempt {attempt + 1}/3): {e}")
+            time.sleep(2)  # รอ 2 วินาทีก่อนลองใหม่
+        except OperationFailure as e:
+            logger.error(f"MongoDB operation failed: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error during MongoDB connection: {e}")
+            return None
+    return None
+
 # เชื่อมต่อ MongoDB
-try:
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    client.admin.command('ping')  # ทดสอบการเชื่อมต่อ
-    logger.info("Connected to MongoDB successfully")
-    db = client["stock-management"]
-    products_collection = db["products"]
-    lots_collection = db["lots"]
-    warehouse_collection = db["warehouses"]  # เปลี่ยนจาก warehouse เป็น warehouses
-    # ตรวจสอบคอลเลคชัน
-    collections = db.list_collection_names()
-    logger.info(f"Collections in database: {collections}")
-except ConnectionFailure as e:
-    logger.error(f"MongoDB connection failed: {e}")
-    raise
-except OperationFailure as e:
-    logger.error(f"MongoDB operation failed: {e}")
-    raise
-except Exception as e:
-    logger.error(f"Unexpected error during MongoDB connection: {e}")
-    raise
+db = connect_mongodb()
+if db is None:
+    logger.error("Failed to connect to MongoDB after retries")
 
 # ฟังก์ชันสำหรับคำสั่ง /start และ /help
 @bot.message_handler(commands=['start', 'help'])
 def handle_start_help(message):
     help_text = (
-        "សូម​បញ្ចូល​លេខកូដ​ផលិតផល​ដែល​អ្នក​ចង់​ដឹង\n"
-        "ហាម​ដក​ឃ្លា ឬ​អក្សរ​តូច\n"
-        "ឧទាហរណ៍៖ 1015KH"
+        "กรุณากรอกรหัสสินค้าที่ต้องการทราบ\n"
+        "ห้ามเว้นวรรคหรืออักษรตัวพิมพ์เล็ก\n"
+        "ตัวอย่าง: 1015KH"
     )
     bot.reply_to(message, help_text)
 
@@ -65,32 +71,37 @@ def handle_start_help(message):
 @bot.message_handler(content_types=['text'])
 def handle_message(message):
     try:
+        if db is None:
+            bot.reply_to(message, "ไม่สามารถเชื่อมต่อฐานข้อมูลได้ กรุณาลองใหม่ภายหลัง")
+            logger.warning("No MongoDB connection available")
+            return
+
         product_code = message.text.strip()
         logger.info(f"Received product code: {product_code}")
         
         # ตรวจสอบว่ารหัสสินค้าถูกต้อง (XXXXKH)
         if not re.match(r'^\d{4}KH$', product_code, re.IGNORECASE):
-            bot.reply_to(message, "សូមបញ្ចូលលេខកូដផលិតផលឲ្យបានត្រឹមត្រូវ (ឧទាហរណ៍: 1015KH)")
+            bot.reply_to(message, "กรุณากรอกรหัสสินค้าให้ถูกต้อง (ตัวอย่าง: 1015KH)")
             return
         
         # ค้นหาสินค้าจากรหัส
+        products_collection = db["products"]
         product = products_collection.find_one({"productCode": product_code})
         if not product:
             logger.warning(f"No product found for code: {product_code}")
-            # ตรวจสอบจำนวนเอกสารในคอลเลคชัน products
             product_count = products_collection.count_documents({})
             logger.info(f"Total products in collection: {product_count}")
-            # แสดงตัวอย่างข้อมูลใน products (ไม่เกิน 5 รายการ)
             sample_products = list(products_collection.find().limit(5))
             logger.info(f"Sample products: {[p['productCode'] for p in sample_products]}")
-            bot.reply_to(message, f"រកមិនឃើញលេខកូដ {product_code} ផលិតផលនេះឡើយ")
+            bot.reply_to(message, f"ไม่พบรหัสสินค้า {product_code}")
             return
 
-        product_id = ObjectId(product["_id"])  # แปลงเป็น ObjectId
+        product_id = ObjectId(product["_id"])
         product_name = product["name"]
         logger.info(f"Found product: {product_code} - {product_name} (ID: {product_id})")
 
         # ค้นหา Lot ที่เกี่ยวข้องและรวม qtyOnHand ตาม Warehouse
+        lots_collection = db["lots"]
         pipeline = [
             {"$match": {"productId": product_id, "status": "active"}},
             {
@@ -101,14 +112,14 @@ def handle_message(message):
             },
             {
                 "$lookup": {
-                    "from": "warehouses",  # เปลี่ยนจาก warehouse เป็น warehouses
+                    "from": "warehouses",
                     "localField": "_id",
                     "foreignField": "_id",
                     "as": "warehouse_info"
                 }
             },
             {"$unwind": "$warehouse_info"},
-            {"$match": {"total_qty": {"$gt": 0}}},  # เฉพาะ Warehouse ที่มีสต็อก
+            {"$match": {"total_qty": {"$gt": 0}}},
             {
                 "$project": {
                     "warehouse_name": "$warehouse_info.name",
@@ -123,7 +134,7 @@ def handle_message(message):
 
         if not results:
             logger.warning(f"No stock found for product: {product_code}")
-            bot.reply_to(message, f"រកមិនឃើញលេខកូដ {product_code} ផលិតផលនេះឡើយ")
+            bot.reply_to(message, f"ไม่พบสต็อกสำหรับ {product_code}")
             return
 
         # สร้างข้อความผลลัพธ์
